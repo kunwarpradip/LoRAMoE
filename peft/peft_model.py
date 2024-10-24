@@ -27,10 +27,10 @@ from accelerate.utils import get_balanced_memory
 from huggingface_hub import hf_hub_download
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
-from transformers.modeling_outputs import SequenceClassifierOutput, TokenClassifierOutput
+from transformers.modeling_outputs import SequenceClassifierOutput, TokenClassifierOutput       
 from transformers.utils import PushToHubMixin
 
-from .tuners import LoraModel, PrefixEncoder, PromptEmbedding, PromptEncoder
+from .tuners import TTLoraModel, LoraModel, PrefixEncoder, PromptEmbedding, PromptEncoder           #changed
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
     WEIGHTS_NAME,
@@ -69,7 +69,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         in the base model if `isinstance(self.peft_config, PromptLearningConfig)`.
     """
 
-    def __init__(self, model, peft_config: PeftConfig): # casualLM, LoraConfig
+    def __init__(self, model, peft_config: PeftConfig): # casualLM, TTLoraConfig
         super().__init__()
         self.peft_config = peft_config
         self.base_model = model
@@ -77,8 +77,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self.modules_to_save = None
         if isinstance(self.peft_config, PromptLearningConfig):
             self._setup_prompt_encoder()
-        else: # --------------> here
-            self.base_model = LoraModel(peft_config, model)
+        else: 
+            self.base_model = TTLoraModel(peft_config, model)                 #changed
         if getattr(self.peft_config, "modules_to_save", None) is not None:
             self.modules_to_save = self.peft_config.modules_to_save
             _set_trainable(self)
@@ -88,7 +88,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         r"""
         Args:
         This function saves the adapter model and the adapter configuration files to a directory, so that it can be
-        re-loaded using the `LoraModel.from_pretrained` class method, and also used by the `LoraModel.push_to_hub`
+        re-loaded using the `TTLoraModel.from_pretrained` class method, and also used by the `TTLoraModel.push_to_hub`
         method.
             save_directory (`str`):
                 Directory where the adapter model and configuration files will be saved (will be created if it does not
@@ -120,16 +120,16 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
     def from_pretrained(cls, model, model_id, **kwargs):
         r"""
         Args:
-        Instantiate a `LoraModel` from a pretrained Lora configuration and weights.
+        Instantiate a `TTLoraModel` from a pretrained TTLora configuration and weights.
             model (`transformers.PreTrainedModel`):
                 The model to be adapted. The model should be initialized with the `from_pretrained` method. from
                 `transformers` library.
             model_id (`str`):
-                The name of the Lora configuration to use. Can be either:
-                    - A string, the `model id` of a Lora configuration hosted inside a model repo on
+                The name of the TTLora configuration to use. Can be either:
+                    - A string, the `model id` of a TTLora configuration hosted inside a model repo on
                         huggingface Hub
-                    - A path to a directory containing a Lora configuration file saved using the
-                        `save_pretrained` method, e.g., ``./my_lora_config_directory/``.
+                    - A path to a directory containing a TTLora configuration file saved using the
+                        `save_pretrained` method, e.g., ``./my_ttlora_config_directory/``.
         """
         from .mapping import MODEL_TYPE_TO_PEFT_MODEL_MAPPING, PEFT_TYPE_TO_CONFIG_MAPPING
 
@@ -179,7 +179,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 )
             model = dispatch_model(model, device_map=device_map)
             hook = AlignDevicesHook(io_same_device=True)
-            if model.peft_config.peft_type == PeftType.LORA:
+            if model.peft_config.peft_type == PeftType.TTLORA:   #changed
                 add_hook_to_module(model.base_model.model, hook)
             else:
                 remove_hook_from_submodules(model.prompt_encoder)
@@ -223,7 +223,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
     def get_prompt_embedding_to_save(self):
         """
         Returns the prompt embedding to save when saving the model. Only applicable when `peft_config.peft_type !=
-        PeftType.LORA`.
+        PeftType.TTLORA`.
         """
         prompt_tokens = self.prompt_tokens.unsqueeze(0).expand(1, -1).to(self.device)
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
@@ -233,7 +233,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
     def get_prompt(self, batch_size):
         """
-        Returns the virtual prompts to use for Peft. Only applicable when `peft_config.peft_type != PeftType.LORA`.
+        Returns the virtual prompts to use for Peft. Only applicable when `peft_config.peft_type != PeftType.TTLORA`.
         """
         prompt_tokens = self.prompt_tokens.unsqueeze(0).expand(batch_size, -1).to(self.device)
         if self.peft_config.peft_type == PeftType.PREFIX_TUNING:
@@ -515,7 +515,7 @@ class PeftModelForCausalLM(PeftModel):
         peft_model = PeftModelForCausalLM(model, peft_config) >>> peft_model.print_trainable_parameters() trainable
     """
 
-    def __init__(self, model, peft_config: PeftConfig): # casualLM, LoraConfig
+    def __init__(self, model, peft_config: PeftConfig): # casualLM, TTLoraConfig
         super().__init__(model, peft_config)
         self.base_model_prepare_inputs_for_generation = self.base_model.prepare_inputs_for_generation
 
@@ -623,9 +623,9 @@ class PeftModelForSeq2SeqLM(PeftModel):
 
         >>> from transformers import AutoModelForSeq2SeqLM >>> from peft import PeftModelForSeq2SeqLM, get_peft_config
         >>> config = {
-                'peft_type': 'LORA', 'task_type': 'SEQ_2_SEQ_LM', 'inference_mode': False, 'r': 8, 'target_modules':
-                ['q', 'v'], 'lora_alpha': 32, 'lora_dropout': 0.1, 'merge_weights': False, 'fan_in_fan_out': False,
-                'enable_lora': None, 'bias': 'none'
+                'peft_type': 'TTLORA', 'task_type': 'SEQ_2_SEQ_LM', 'inference_mode': False, 'r': 8, 'target_modules':
+                ['q', 'v'], 'tt_alpha': 32, 'tt_dropout': 0.1, 'merge_weights': False, 'fan_in_fan_out': False,
+                'enable_ttlora': None, 'bias': 'none'
             }
         >>> peft_config = get_peft_config(config) >>> model = AutoModelForSeq2SeqLM.from_pretrained("t5-base") >>>
         peft_model = PeftModelForSeq2SeqLM(model, peft_config) >>> peft_model.print_trainable_parameters() trainable

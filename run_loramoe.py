@@ -24,6 +24,8 @@ https://huggingface.co/models?filter=text-generation
 import logging
 import math
 import os
+from typing import Optional, Tuple
+
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -33,7 +35,7 @@ import torch
 from build_dataset import build_instruction_dataset, DataCollatorForSupervisedDataset
 import transformers
 from transformers import (
-    CONFIG_MAPPING,
+    CONFIG_MAPPING,             
     AutoConfig,
     BitsAndBytesConfig,
     LlamaForCausalLM,
@@ -48,7 +50,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
 
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model_state_dict
+from peft import TTLoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model_state_dict
 from peft.tuners.lora import LoraLayer
 
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -57,14 +59,16 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
 
-class SavePeftModelCallback(transformers.TrainerCallback):
+class SavePeftModelCallback(transformers.TrainerCallback): #extension of TrainerCallback (a part of HF library) to create hooks for training loop
     def save_model(self, args, state, kwargs):
+        """Save the best model checkpoint: if available use it else create it using current global_step 
+        as name so that each save point is uniquely identified"""
         if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "sft_lora_model")
+            checkpoint_folder = os.path.join(state.best_model_checkpoint, "sft_tt_lora_model")  #changed
         else:
             checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
 
-        peft_model_path = os.path.join(checkpoint_folder, "sft_lora_model")
+        peft_model_path = os.path.join(checkpoint_folder, "sft_tt_lora_model") #changed
         kwargs["model"].save_pretrained(peft_model_path)
         kwargs["tokenizer"].save_pretrained(peft_model_path)
 
@@ -73,11 +77,14 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
+        """Same as save_model it ensure the model and tokenizer are saved in the proper directory
+        at the end of the training"""
         peft_model_path = os.path.join(args.output_dir, "sft_lora_model")
         kwargs["model"].save_pretrained(peft_model_path)
         kwargs["tokenizer"].save_pretrained(peft_model_path)
 
 
+#this method looks more about training efficiency and precision handling
 def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True):
     r"""
     This method wraps the entire protocol for preparing a model before running a training. This includes:
@@ -101,11 +108,15 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True):
 
     for name, module in model.named_modules():
         if 'norm' in name:
+            """As normalization layer operates in higher precision, it needs to be maintained with float32 precision"""
             module = module.to(torch.float32)
 
     if loaded_in_kbit and use_gradient_checkpointing:
         # For backward compatibility
         if hasattr(model, "enable_input_require_grads"):
+            """Checks if input to embedding layer grad computation exist in the model and if it does it calls 
+            enable input require grads to make sure the grad computation is on, else creates a forward hook function to ensure 
+            the output of the input embeddings will always require gradients"""
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, _input, output):
@@ -117,7 +128,7 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True):
 
     return model
 
-
+#acts like a data structure to manage the configuration parameters for a model setup using HF library
 @dataclass
 class ModelArguments:
     """
@@ -232,20 +243,28 @@ class DataTrainingArguments:
     max_seq_length: Optional[int] = field(default=1024)
 
 
-@dataclass
+@dataclass      #changed class parameters
 class MyTrainingArguments(TrainingArguments):
-    trainable : Optional[str] = field(default="q_proj,v_proj")
-    lora_rank : Optional[int] = field(default=8)
-    lora_dropout : Optional[float] = field(default=0.1)
-    lora_alpha : Optional[float] = field(default=32.)
+    trainable : Optional[str] = field(default="q_proj,v_proj") #no changes since TTLoRA adapts in the same weights as LoRA
+    
+    # lora_rank : Optional[int] = field(default=8)
+    tt_rank: Optional[int] = field(default=4)
+    # lora_dropout : Optional[float] = field(default=0.1)
+    tt_dropout : Optional[float] = field(default=0.1) #not defined in the original model, but just keeping it incase
+    # lora_alpha : Optional[float] = field(default=32.)
+    tt_alpha : Optional[int] = field(default=1)
+    tt_shape: Optional[Tuple[int, ...]] = field(default=(1, 1, 1))
+    
     modules_to_save : Optional[str] = field(default=None)
-    peft_path : Optional[str] = field(default=None)
+    peft_path : Optional[str] = field(default=None) #path to pre-trianed peft ttlora model
+
     flash_attn : Optional[bool] = field(default=False)
     double_quant: Optional[bool] = field(default=True)
     quant_type: Optional[str] = field(default="nf4")
     load_in_kbits: Optional[int] = field(default=16)
     
-    lora_nums: Optional[int] = field(default=2)
+    # lora_nums: Optional[int] = field(default=2)
+    num_experts: Optional[int] = field(default=2)
     blc_alpha: Optional[float] = field(default=0.0)
     blc_weight: Optional[float] = field(default=0.0)
 
@@ -325,6 +344,8 @@ def main():
         logger.warning("You are instantiating a new config instance from scratch.")
         if model_args.config_overrides is not None:
             logger.info(f"Overriding config: {model_args.config_overrides}")
+            #change here; watch out for the config_overrides variable
+            """this method update_from_string is used to apply overrides to the instantiated configuration"""
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
 
@@ -417,7 +438,10 @@ def main():
         quantization_config = None
     if quantization_config is not None:
         logger.info(f"quantization_config:{quantization_config.to_dict()}")
-    device_map = {"":int(os.environ.get("LOCAL_RANK") or 0)}
+
+    device_map = {"":int(os.environ.get("LOCAL_RANK") or 0)} #GPU setting
+
+    #model initialization
     model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -431,7 +455,7 @@ def main():
         load_in_8bit=load_in_8bit,
         quantization_config=quantization_config,
     )
-    model.enable_input_require_grads()
+    model.enable_input_require_grads()   #grad for input to embedding 
     if training_args.load_in_kbits in [4, 8]:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
     model.config.use_cache = False
@@ -443,41 +467,67 @@ def main():
         logger.info(f"Resize model vocab size to {len(tokenizer)}")
         model.resize_token_embeddings(len(tokenizer))
 
-    if training_args.peft_path is not None: # --------------------------> train from the trained lora model
+    #changed
+    if training_args.peft_path is not None: # load a pre-trained tt_lora peft model from the peft path and start combined training 
         logger.info("Peft from pre-trained model")
 
         model = PeftModel.from_pretrained(model, training_args.peft_path,
             # device_map=device_map
             )
-    else: # --------------------------> train from the sketch
+    else: # if not then it initializes a new peft model configuration based on the training arguments
         logger.info("Init new peft model") 
-        target_modules = training_args.trainable.split(',') # lora paras
-        modules_to_save = training_args.modules_to_save # not lora paras, but is trainable, i.e., not freeze
+        target_modules = training_args.trainable.split(',') # Parameters where tt_lora is implemented (Default are q_proj, v_proj)
+        modules_to_save = training_args.modules_to_save # not adapted with tt_lora but are trainable (if any modules other than tt_lora adaptation needs to be trained)
         if modules_to_save is not None:
             modules_to_save = modules_to_save.split(',')
-        lora_rank = training_args.lora_rank
-        lora_dropout = training_args.lora_dropout
-        lora_alpha = training_args.lora_alpha
+        # lora_rank = training_args.lora_rank
+        tt_rank = training_args.tt_rank
+        # lora_dropout = training_args.lora_dropout
+        tt_dropout = training_args.tt_dropout
+        # lora_alpha = training_args.lora_alpha
+        tt_alpha = training_args.tt_alpha
+        tt_shape = training_args.tt_shape
         
-        lora_nums = training_args.lora_nums
+        # lora_nums = training_args.lora_nums
+        num_experts = training_args.num_experts
+
         blc_alpha = training_args.blc_alpha
         blc_weight = training_args.blc_weight
         
-        
+        #changed
         logger.info(f"target_modules: {target_modules}")
-        logger.info(f"lora_rank: {lora_rank}")
-        logger.info(f"lora_nums: {lora_nums}")
+        # logger.info(f"lora_rank: {lora_rank}")
+        logger.info(f"tt_rank: {tt_rank}")
+        # logger.info(f"lora_nums: {lora_nums}")
+        logger.info(f"num_experts: {num_experts}")
+
         logger.info(f"blc_alpha: {blc_alpha}")
         logger.info(f"blc_weight: {blc_weight}")
 
-        peft_config = LoraConfig(
+        #changed
+        # peft_config = LoraConfig(
+        #     task_type=TaskType.CAUSAL_LM,
+        #     target_modules=target_modules,
+        #     inference_mode=False,
+        #     r=lora_rank, 
+        #     lora_alpha=lora_alpha,
+        #     lora_dropout=lora_dropout,
+        #     # lora_nums=lora_nums,
+        #     num_experts=num_experts,
+        #     blc_alpha=blc_alpha,
+        #     blc_weight=blc_weight,
+        #     modules_to_save=modules_to_save
+        #     )
+        peft_config = TTLoraConfig(
             task_type=TaskType.CAUSAL_LM,
             target_modules=target_modules,
             inference_mode=False,
-            r=lora_rank, 
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            lora_nums=lora_nums,
+            tt_rank=tt_rank, 
+            tt_alpha=tt_alpha,
+            tt_dropout=tt_dropout,
+            tt_shape=tt_shape,
+            # lora_nums=lora_nums,
+            num_experts=num_experts,
             blc_alpha=blc_alpha,
             blc_weight=blc_weight,
             modules_to_save=modules_to_save
@@ -485,6 +535,9 @@ def main():
         
         model = get_peft_model(model, peft_config)
 
+    """Gradient checkpointing is a technique used to reduce memory usage during the training of deep learning networks
+    by not storing immediate activations for all layers, instead it stores just enough to recompute these activations
+    during the backward pass"""
     if training_args.gradient_checkpointing and \
         (not model.modules_to_save or 'embed_tokens' not in model.modules_to_save):
         # enable requires_grad to avoid exception during backward pass when using gradient_checkpoint without tuning embed.
@@ -494,7 +547,8 @@ def main():
             def make_inputs_require_grad(_module, _input, _output):
                 _output.requires_grad_(True)
             model.base_model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-    for name, module in model.named_modules():
+    
+    for name, module in model.named_modules():  #retrieves name and the module
         if isinstance(module, LoraLayer):
             if training_args.bf16:
                 module = module.to(torch.bfloat16)
@@ -508,6 +562,7 @@ def main():
                     module = module.to(torch.bfloat16)
                 if training_args.fp16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.float16)
+    
     model.print_trainable_parameters()
     logger.info(f"model.modules_to_save: {model.modules_to_save}")
     old_state_dict = model.state_dict
